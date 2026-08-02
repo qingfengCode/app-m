@@ -1,7 +1,89 @@
-# Tauri + Vue + TypeScript
+# App-M 应用管理器
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+一个桌面应用管理器，支持图形化界面一键启动/关闭应用、实时监控进程资源、静态服务器托管与系统辅助工具。
 
-## Recommended IDE Setup
+<img width="1091" height="700" alt="image" src="https://github.com/user-attachments/assets/68685ede-f3e6-4306-ba43-dbff7e1e3846" />
 
-- [VS Code](https://code.visualstudio.com/) + [Vue - Official](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## 功能特性
+
+- **应用管理**
+  - 一键启动 / 优雅关闭 / 强制关闭 / 重启
+  - 批量启动全部、批量停止全部
+  - 支持分组管理与自定义排序
+  - 配置启动命令、工作目录、环境变量、启动延迟
+  - 开机/启动时自动启动指定应用
+- **进程监控**
+  - 实时显示进程 CPU、内存占用
+  - 网络上下行速率统计（Windows）
+  - 近 1 小时资源占用趋势图表
+  - 系统全局 CPU / 内存概览
+- **自动重启**
+  - 监控文件目录，文件变更后自动重启应用（防抖）
+  - 进程退出后自动重启（可配置）
+- **静态服务器**
+  - 内置静态文件服务器，支持 SPA 模式与反向代理规则
+  - 端口可配置，启动后直接打开访问地址
+- **运行日志**
+  - 实时捕获 stdout / stderr 日志
+  - 日志滚动保留（最多 2000 条），可一键清空
+- **系统工具箱**
+  - 查找进程、查找端口占用、按 PID 终止进程
+  - Hosts 文件管理（编辑/启停条目，自动备份）与 DNS 缓存刷新
+- **数据持久化**
+  - 应用配置保存于 `~/.app-m/apps.json`
+  - 支持配置导入 / 导出
+- **系统托盘**
+  - 关闭窗口时隐藏到系统托盘，常驻后台运行
+  - 托盘菜单提供显示主窗口 / 退出
+
+## 技术栈
+
+| 部分 | 技术 |
+| ---- | ---- |
+| 桌面框架 | Tauri 2 |
+| 前端 | Vue 3 (`<script setup>`) + TypeScript |
+| UI 组件 | Element Plus |
+| 构建工具 | Vite 6 |
+| 后端 | Rust（axum、sysinfo、notify、serde） |
+
+## 环境要求
+
+- Node.js 18+ 与 npm
+- Rust（stable）与 Cargo
+- Tauri 2 平台依赖（Windows 需 WebView2 / MSVC Build Tools）
+
+## 开发
+
+```bash
+# 安装依赖
+npm install
+
+# 启动前端开发服务器
+npm run dev
+
+# 启动桌面应用（开发模式）
+npm run tauri dev
+
+# 前端构建
+npm run build
+
+# 构建桌面应用
+npm run tauri build
+```
+
+## 使用说明
+
+1. 在主页点击"添加应用"，填写名称与启动命令（如 `npm run dev`）。
+2. 点击"启动"运行应用，卡片上将实时显示 PID、CPU、内存占用。
+3. 点击"关闭"发送优雅关闭信号；如需强制结束，使用"强制关闭"。
+4. 可在应用设置中开启"文件变更自动重启"或"退出自动重启"。
+5. 顶部工具栏可切换至系统工具箱，进行进程 / 端口 / Hosts 管理。
+
+## 数据存储
+
+- 应用配置：`~/.app-m/apps.json`
+- 配置导出格式：JSON（与配置文件一致，可导入恢复）
+
+## 许可证
+
+MIT
