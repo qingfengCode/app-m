@@ -1,6 +1,6 @@
 use crate::models::{
     AddAppParams, AppConfig, AppInstance, AppState, AppType, CommandResult, LogEntry, MetricPoint,
-    PersistData, ProcessInfo, SystemInfo, UpdateAppParams, UpdateSortOrderParams,
+    PersistData, ProcessInfo, StaticServerConfig, SystemInfo, UpdateAppParams, UpdateSortOrderParams,
 };
 use crate::static_server;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind, Config as NotifyConfig};
@@ -61,25 +61,11 @@ fn push_log(logs: &mut Vec<LogEntry>, level: &str, content: &str) {
     }
 }
 
-fn add_log(instance: &mut AppInstance, level: &str, content: &str) {
-    if instance.logs.is_none() {
-        instance.logs = Some(Vec::new());
-    }
-    if let Some(ref mut logs) = instance.logs {
-        push_log(logs, level, content);
-    }
-}
-
 fn push_to_buffer(log_buffers: &Mutex<HashMap<String, Arc<Mutex<Vec<LogEntry>>>>>, app_id: &str, level: &str, content: &str) {
     let buffers = log_buffers.lock().unwrap();
     if let Some(buf) = buffers.get(app_id) {
         push_log(&mut buf.lock().unwrap(), level, content);
     }
-}
-
-fn log_both(instance: &mut AppInstance, log_buffers: &Mutex<HashMap<String, Arc<Mutex<Vec<LogEntry>>>>>, app_id: &str, level: &str, content: &str) {
-    add_log(instance, level, content);
-    push_to_buffer(log_buffers, app_id, level, content);
 }
 
 fn build_command(instance: &AppInstance) -> Command {
@@ -225,7 +211,7 @@ fn spawn_and_track(
             } else {
                 format!("{}启动成功，PID: {}", tag, pid)
             };
-            log_both(instance, log_buffers, &app_id, "info", &log_msg);
+            push_to_buffer(log_buffers, &app_id, "info", &log_msg);
 
             if let Some(stdout) = child.stdout.take() {
                 let buf = log_buffers.lock().unwrap().get(&app_id).cloned();
@@ -256,7 +242,7 @@ fn spawn_and_track(
         }
         Err(e) => {
             let msg = format!("{}启动失败: {}", tag, e);
-            log_both(instance, log_buffers, &app_id, "error", &msg);
+            push_to_buffer(log_buffers, &app_id, "error", &msg);
             false
         }
     }
@@ -480,7 +466,7 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
                                 {
                                     let mut apps_map = state.apps.lock().unwrap();
                                     if let Some(inst) = apps_map.get_mut(&watch_id) {
-                                        add_log(inst, "info", "文件变更，准备自动重启...");
+                                        push_to_buffer(&state.log_buffers, &watch_id, "info", "文件变更，准备自动重启...");
                                         inst.running = false;
                                         inst.pid = None;
                                         inst.process_info = None;
@@ -495,7 +481,7 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
                                 {
                                     let mut apps_map = state.apps.lock().unwrap();
                                     if let Some(inst) = apps_map.get_mut(&watch_id) {
-                                        add_log(inst, "info", "文件变更，准备自动重启...");
+                                        push_to_buffer(&state.log_buffers, &watch_id, "info", "文件变更，准备自动重启...");
                                         inst.running = false;
                                         inst.pid = None;
                                         inst.process_info = None;
@@ -514,9 +500,9 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
                                 let mut apps_map = state.apps.lock().unwrap();
                                 if let Some(inst) = apps_map.get_mut(&watch_id) {
                                     if spawn_and_track(inst, "自动重启", &state.children, &state.log_buffers, &state.job_object) {
-                                        add_log(inst, "info", "文件变更自动重启成功");
+                                        push_to_buffer(&state.log_buffers, &watch_id, "info", "文件变更自动重启成功");
                                     } else {
-                                        add_log(inst, "error", "文件变更自动重启失败");
+                                        push_to_buffer(&state.log_buffers, &watch_id, "error", "文件变更自动重启失败");
                                     }
                                 }
                             }
@@ -546,13 +532,13 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
                                             inst.running = true;
                                             inst.server_port = Some(port);
                                             inst.started_at = Some(now_ts());
-                                            add_log(inst, "info", &format!("文件变更自动重启成功，端口: {}", port));
+                                            push_to_buffer(&state.log_buffers, &watch_id, "info", &format!("文件变更自动重启成功，端口: {}", port));
                                         }
                                     }
                                     Err(e) => {
-                                        let mut apps_map = state.apps.lock().unwrap();
-                                        if let Some(inst) = apps_map.get_mut(&watch_id) {
-                                            add_log(inst, "error", &format!("文件变更自动重启失败: {}", e));
+                                        let apps_map = state.apps.lock().unwrap();
+                                        if apps_map.contains_key(&watch_id) {
+                                            push_to_buffer(&state.log_buffers, &watch_id, "error", &format!("文件变更自动重启失败: {}", e));
                                         }
                                     }
                                 }
@@ -691,30 +677,27 @@ pub fn delete_app(
     }
 }
 
-fn strip_logs(instances: &mut [AppInstance]) {
-    for inst in instances {
-        inst.logs = None;
-    }
-}
-
 #[tauri::command]
 pub fn list_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<AppInstance>>, String> {
     let apps = state.apps.lock().unwrap();
     let mut list: Vec<AppInstance> = apps.values().cloned().collect();
-    strip_logs(&mut list);
     list.sort_by_key(|a| a.config.sort_order);
     Ok(CommandResult::success(list))
 }
 
 #[tauri::command]
-pub fn start_app(
+pub async fn start_app(
     state: State<'_, AppState>,
     app: AppHandle,
     id: String,
 ) -> Result<CommandResult<String>, String> {
-    let mut apps = state.apps.lock().unwrap();
+    // 第一阶段：锁内确认状态并启动/收集数据，锁在块结束时释放
+    let (pid, sc_clone): (Option<u32>, Option<StaticServerConfig>) = {
+        let mut apps = state.apps.lock().unwrap();
+        let Some(instance) = apps.get_mut(&id) else {
+            return Ok(CommandResult::error("应用不存在"));
+        };
 
-    if let Some(instance) = apps.get_mut(&id) {
         if instance.running {
             return Ok(CommandResult::error("应用已经在运行中"));
         }
@@ -722,74 +705,75 @@ pub fn start_app(
         match instance.config.app_type {
             AppType::Command => {
                 if spawn_and_track(instance, "", &state.children, &state.log_buffers, &state.job_object) {
-                    let pid = instance.pid.unwrap();
-                    drop(apps);
-                    save_apps_to_disk(&state);
-                    start_file_watcher(&state, &app, &id);
-                    Ok(CommandResult::success(pid.to_string()))
+                    (Some(instance.pid.unwrap()), None)
                 } else {
-                    Ok(CommandResult::error("启动失败"))
+                    return Ok(CommandResult::error("启动失败"));
                 }
             }
-            AppType::StaticServer => {
-                if let Some(ref sc) = instance.config.static_server {
-                    let sc_clone = sc.clone();
-                    let port = sc.port;
-
-                    drop(apps);
-
-                    match tauri::async_runtime::block_on(async {
-                        static_server::start_static_server(&sc_clone).await
-                    })
-                    {
-                        Ok(abort_handle) => {
-                            state.running_servers.lock().unwrap().insert(id.clone(), abort_handle);
-                            let mut apps = state.apps.lock().unwrap();
-                            if let Some(inst) = apps.get_mut(&id) {
-                                inst.running = true;
-                                inst.server_port = Some(port);
-                                inst.started_at = Some(now_ts());
-                                add_log(inst, "info", &format!("静态服务器启动，端口: {}", port));
-                            }
-                            drop(apps);
-                            save_apps_to_disk(&state);
-                            start_file_watcher(&state, &app, &id);
-                            Ok(CommandResult::success(format!("http://localhost:{}", port)))
-                        }
-                        Err(e) => {
-                            let mut apps = state.apps.lock().unwrap();
-                            if let Some(inst) = apps.get_mut(&id) {
-                                add_log(inst, "error", &format!("静态服务器启动失败: {}", e));
-                            }
-                            Ok(CommandResult::error(format!("启动失败: {}", e)))
-                        }
-                    }
-                } else {
-                    Ok(CommandResult::error("缺少静态服务器配置"))
-                }
-            }
+            AppType::StaticServer => match &instance.config.static_server {
+                Some(sc) => (None, Some(sc.clone())),
+                None => return Ok(CommandResult::error("缺少静态服务器配置")),
+            },
         }
-    } else {
-        Ok(CommandResult::error("应用不存在"))
+    };
+
+    // 锁已释放
+    if let Some(pid) = pid {
+        save_apps_to_disk(&state);
+        start_file_watcher(&state, &app, &id);
+        return Ok(CommandResult::success(pid.to_string()));
+    }
+
+    let Some(sc) = sc_clone else {
+        return Ok(CommandResult::error("缺少静态服务器配置"));
+    };
+    let port = sc.port;
+
+    match static_server::start_static_server(&sc).await {
+        Ok(abort_handle) => {
+            state.running_servers.lock().unwrap().insert(id.clone(), abort_handle);
+            {
+                let mut apps = state.apps.lock().unwrap();
+                if let Some(inst) = apps.get_mut(&id) {
+                    inst.running = true;
+                    inst.server_port = Some(port);
+                    inst.started_at = Some(now_ts());
+                    push_to_buffer(&state.log_buffers, &id, "info", &format!("静态服务器启动，端口: {}", port));
+                }
+            }
+            save_apps_to_disk(&state);
+            start_file_watcher(&state, &app, &id);
+            Ok(CommandResult::success(format!("http://localhost:{}", port)))
+        }
+        Err(e) => {
+            let mut apps = state.apps.lock().unwrap();
+            if let Some(_) = apps.get_mut(&id) {
+                push_to_buffer(&state.log_buffers, &id, "error", &format!("静态服务器启动失败: {}", e));
+            }
+            Ok(CommandResult::error(format!("启动失败: {}", e)))
+        }
     }
 }
 
 #[tauri::command]
-pub fn stop_app(
+pub async fn stop_app(
     state: State<'_, AppState>,
     id: String,
     force: bool,
 ) -> Result<CommandResult<()>, String> {
-    let mut apps = state.apps.lock().unwrap();
-
-    if let Some(instance) = apps.get_mut(&id) {
+    // 锁内处理状态变更；Command 分支无 await，在锁内完成并返回
+    {
+        let mut apps = state.apps.lock().unwrap();
+        let Some(instance) = apps.get_mut(&id) else {
+            return Ok(CommandResult::error("应用不存在"));
+        };
         if !instance.running {
             return Ok(CommandResult::error("应用未在运行中"));
         }
 
         match instance.config.app_type {
             AppType::StaticServer => {
-                add_log(instance, "info", "正在停止静态服务器...");
+                push_to_buffer(&state.log_buffers, &id, "info", "正在停止静态服务器...");
                 instance.running = false;
                 instance.pid = None;
                 instance.process_info = None;
@@ -797,22 +781,10 @@ pub fn stop_app(
                 instance.server_port = None;
                 instance.exit_reason = Some("手动停止".to_string());
                 instance.manual_stop = true;
-                add_log(instance, "info", "静态服务器已停止");
-                drop(apps);
-                if let Some(handle) = state.running_servers.lock().unwrap().remove(&id) {
-                    handle.abort();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                stop_file_watcher(&state, &id);
-                save_apps_to_disk(&state);
-                Ok(CommandResult {
-                    code: 0,
-                    data: None,
-                    msg: "静态服务器已停止".to_string(),
-                })
+                push_to_buffer(&state.log_buffers, &id, "info", "静态服务器已停止");
             }
             AppType::Command => {
-                add_log(instance, "info", if force { "强制终止进程" } else { "终止进程" });
+                push_to_buffer(&state.log_buffers, &id, "info", if force { "强制终止进程" } else { "终止进程" });
                 let real_pid = instance.pid;
                 drop(apps);
 
@@ -827,9 +799,9 @@ pub fn stop_app(
                         instance.started_at = None;
                         instance.exit_reason = Some(if force { "手动强制关闭".to_string() } else { "手动关闭".to_string() });
                         instance.manual_stop = true;
-                        add_log(instance, "info", if force { "已强制关闭" } else { "已关闭" });
+                        push_to_buffer(&state.log_buffers, &id, "info", if force { "已强制关闭" } else { "已关闭" });
                     } else {
-                        add_log(instance, "error", "关闭失败");
+                        push_to_buffer(&state.log_buffers, &id, "error", "关闭失败");
                     }
                 }
                 drop(apps);
@@ -838,23 +810,32 @@ pub fn stop_app(
                 save_apps_to_disk(&state);
 
                 if killed || force {
-                    Ok(CommandResult {
+                    return Ok(CommandResult {
                         code: 0,
                         data: None,
                         msg: if force { "已强制关闭".to_string() } else { "已关闭".to_string() },
-                    })
-                } else {
-                    Ok(CommandResult::error("关闭失败"))
+                    });
                 }
+                return Ok(CommandResult::error("关闭失败"));
             }
         }
-    } else {
-        Ok(CommandResult::error("应用不存在"))
     }
+    // 锁已释放，继续静态服务器停止流程
+    if let Some(handle) = state.running_servers.lock().unwrap().remove(&id) {
+        handle.abort();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    stop_file_watcher(&state, &id);
+    save_apps_to_disk(&state);
+    Ok(CommandResult {
+        code: 0,
+        data: None,
+        msg: "静态服务器已停止".to_string(),
+    })
 }
 
 #[tauri::command]
-pub fn restart_app(
+pub async fn restart_app(
     state: State<'_, AppState>,
     app: AppHandle,
     id: String,
@@ -877,7 +858,7 @@ pub fn restart_app(
             if instance.running {
                 match instance.config.app_type {
                     AppType::Command => {
-                        add_log(instance, "info", "重启：关闭旧进程");
+                        push_to_buffer(&state.log_buffers, &id, "info", "重启：关闭旧进程");
                         instance.running = false;
                         instance.pid = None;
                         instance.process_info = None;
@@ -885,7 +866,7 @@ pub fn restart_app(
                         instance.exit_reason = Some("重启".to_string());
                     }
                     AppType::StaticServer => {
-                        add_log(instance, "info", "重启：停止静态服务器");
+                        push_to_buffer(&state.log_buffers, &id, "info", "重启：停止静态服务器");
                         instance.running = false;
                         instance.pid = None;
                         instance.process_info = None;
@@ -902,7 +883,7 @@ pub fn restart_app(
         kill_child(&state.children, &id, true, None);
         state.children.lock().unwrap().remove(&id);
         stop_file_watcher(&state, &id);
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     if app_type == AppType::StaticServer {
@@ -910,7 +891,7 @@ pub fn restart_app(
             handle.abort();
         }
         stop_file_watcher(&state, &id);
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     match app_type {
@@ -947,9 +928,7 @@ pub fn restart_app(
                 }
             }
 
-            match tauri::async_runtime::block_on(async {
-                static_server::start_static_server(&sc_clone).await
-            })
+            match static_server::start_static_server(&sc_clone).await
             {
                 Ok(abort_handle) => {
                     state.running_servers.lock().unwrap().insert(id.clone(), abort_handle);
@@ -958,7 +937,7 @@ pub fn restart_app(
                         inst.running = true;
                         inst.server_port = Some(port);
                         inst.started_at = Some(now_ts());
-                        add_log(inst, "info", &format!("静态服务器重启成功，端口: {}", port));
+                        push_to_buffer(&state.log_buffers, &id, "info", &format!("静态服务器重启成功，端口: {}", port));
                     }
                     drop(apps);
                     save_apps_to_disk(&state);
@@ -972,33 +951,46 @@ pub fn restart_app(
 }
 
 #[tauri::command]
-pub fn start_all_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<String>>, String> {
-    let mut apps = state.apps.lock().unwrap();
+pub async fn start_all_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<String>>, String> {
+    // 先在锁内收集启动计划，锁在块结束时释放
+    let plan: Vec<(String, AppType, u32, Option<StaticServerConfig>)> = {
+        let apps = state.apps.lock().unwrap();
+        let mut sorted_ids: Vec<String> = apps
+            .iter()
+            .filter(|(_, i)| !i.running)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        sorted_ids.sort_by(|a, b| {
+            let a_order = apps.get(a).map(|i| i.config.sort_order).unwrap_or(0);
+            let b_order = apps.get(b).map(|i| i.config.sort_order).unwrap_or(0);
+            a_order.cmp(&b_order)
+        });
+
+        sorted_ids
+            .into_iter()
+            .filter_map(|id| {
+                apps.get(&id).map(|i| {
+                    (
+                        id,
+                        i.config.app_type.clone(),
+                        i.config.delay_seconds,
+                        i.config.static_server.clone(),
+                    )
+                })
+            })
+            .collect()
+    };
+
     let mut started = Vec::new();
-    let mut sorted_ids: Vec<String> = apps
-        .iter()
-        .filter(|(_, i)| !i.running)
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    sorted_ids.sort_by(|a, b| {
-        let a_order = apps.get(a).map(|i| i.config.sort_order).unwrap_or(0);
-        let b_order = apps.get(b).map(|i| i.config.sort_order).unwrap_or(0);
-        a_order.cmp(&b_order)
-    });
-
-    for id in sorted_ids {
-        let delay = apps.get(&id).map(|i| i.config.delay_seconds).unwrap_or(0);
-        let app_type = apps.get(&id).map(|i| i.config.app_type.clone()).unwrap_or(AppType::Command);
-
+    for (id, app_type, delay, sc) in plan {
         if delay > 0 {
-            drop(apps);
-            std::thread::sleep(std::time::Duration::from_secs(delay as u64));
-            apps = state.apps.lock().unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
         }
 
         match app_type {
             AppType::Command => {
+                let mut apps = state.apps.lock().unwrap();
                 if let Some(instance) = apps.get_mut(&id) {
                     if spawn_and_track(instance, "批量", &state.children, &state.log_buffers, &state.job_object) {
                         started.push(instance.config.name.clone());
@@ -1006,15 +998,9 @@ pub fn start_all_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<St
                 }
             }
             AppType::StaticServer => {
-                let sc_clone = apps.get(&id).and_then(|i| i.config.static_server.clone());
-                let port = sc_clone.as_ref().map(|sc| sc.port);
-
-                drop(apps);
-
-                if let (Some(sc), Some(port)) = (sc_clone, port) {
-                    match tauri::async_runtime::block_on(async {
-                        static_server::start_static_server(&sc).await
-                    }) {
+                if let Some(sc) = sc {
+                    let port = sc.port;
+                    match static_server::start_static_server(&sc).await {
                         Ok(abort_handle) => {
                             state.running_servers.lock().unwrap().insert(id.clone(), abort_handle);
                             let mut apps = state.apps.lock().unwrap();
@@ -1022,25 +1008,22 @@ pub fn start_all_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<St
                                 inst.running = true;
                                 inst.server_port = Some(port);
                                 inst.started_at = Some(now_ts());
-                                add_log(inst, "info", &format!("批量启动静态服务器，端口: {}", port));
+                                push_to_buffer(&state.log_buffers, &id, "info", &format!("批量启动静态服务器，端口: {}", port));
                                 started.push(inst.config.name.clone());
                             }
                         }
                         Err(e) => {
                             let mut apps = state.apps.lock().unwrap();
-                            if let Some(inst) = apps.get_mut(&id) {
-                                add_log(inst, "error", &format!("批量启动静态服务器失败: {}", e));
+                            if let Some(_) = apps.get_mut(&id) {
+                                push_to_buffer(&state.log_buffers, &id, "error", &format!("批量启动静态服务器失败: {}", e));
                             }
                         }
                     }
                 }
-
-                apps = state.apps.lock().unwrap();
             }
         }
     }
 
-    drop(apps);
     save_apps_to_disk(&state);
     Ok(CommandResult::success(started))
 }
@@ -1346,7 +1329,7 @@ pub fn get_metrics(
 }
 
 #[tauri::command]
-pub fn stop_all_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<String>>, String> {
+pub async fn stop_all_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<String>>, String> {
     let ids: Vec<String> = {
         let apps = state.apps.lock().unwrap();
         apps.iter()
@@ -1382,7 +1365,7 @@ pub fn stop_all_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<Str
     }
 
     if !server_ids.is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
     let mut apps = state.apps.lock().unwrap();
@@ -1395,7 +1378,7 @@ pub fn stop_all_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<Str
             instance.server_port = None;
             instance.exit_reason = Some("批量关闭".to_string());
             instance.manual_stop = true;
-            add_log(instance, "info", "批量关闭");
+            push_to_buffer(&state.log_buffers, id, "info", "批量关闭");
             stopped.push(instance.config.name.clone());
         }
     }
@@ -1426,21 +1409,12 @@ pub fn get_app_logs(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<CommandResult<Vec<LogEntry>>, String> {
-    {
-        let buffers = state.log_buffers.lock().unwrap();
-        if let Some(buf) = buffers.get(&id) {
-            let logs = buf.lock().unwrap();
-            return Ok(CommandResult::success(logs.clone()));
-        }
+    let buffers = state.log_buffers.lock().unwrap();
+    if let Some(buf) = buffers.get(&id) {
+        let logs = buf.lock().unwrap();
+        return Ok(CommandResult::success(logs.clone()));
     }
-    // buffers 中不存在时，先释放 log_buffers 再锁 apps，避免与 refresh_all 的
-    // apps -> log_buffers 顺序形成交叉死锁
-    let apps = state.apps.lock().unwrap();
-    if let Some(instance) = apps.get(&id) {
-        Ok(CommandResult::success(instance.logs.clone().unwrap_or_default()))
-    } else {
-        Ok(CommandResult::error("应用不存在"))
-    }
+    Ok(CommandResult::success(vec![]))
 }
 
 #[tauri::command]
@@ -1448,17 +1422,9 @@ pub fn clear_app_logs(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<CommandResult<()>, String> {
-    {
-        let mut apps = state.apps.lock().unwrap();
-        if let Some(instance) = apps.get_mut(&id) {
-            instance.logs = None;
-        }
-    }
-    {
-        let buffers = state.log_buffers.lock().unwrap();
-        if let Some(buf) = buffers.get(&id) {
-            buf.lock().unwrap().clear();
-        }
+    let buffers = state.log_buffers.lock().unwrap();
+    if let Some(buf) = buffers.get(&id) {
+        buf.lock().unwrap().clear();
     }
     Ok(CommandResult { code: 0, data: None, msg: "日志已清空".to_string() })
 }
@@ -1491,14 +1457,14 @@ fn read_process_io(_pid: u32) -> (u64, u64) {
 }
 
 #[tauri::command]
-pub fn refresh_all(
+pub async fn refresh_all(
     state: State<'_, AppState>,
 ) -> Result<CommandResult<Vec<AppInstance>>, String> {
     let pids: Vec<Pid> = {
         let apps = state.apps.lock().unwrap();
         apps.values().filter_map(|i| i.pid).map(Pid::from_u32).collect()
     };
-    {
+    let (restart_ids, has_changes) = {
         let mut sys = state.system.lock().unwrap();
         sys.refresh_processes(ProcessesToUpdate::Some(&pids), true);
 
@@ -1584,7 +1550,7 @@ pub fn refresh_all(
                         }
 
                         if instance.running {
-                            log_both(instance, &state.log_buffers, id, "warn", &exit_msg);
+                            push_to_buffer(&state.log_buffers, id, "warn", &exit_msg);
                             exited_apps.push(instance.config.name.clone());
                         }
                         instance.running = false;
@@ -1620,37 +1586,36 @@ pub fn refresh_all(
             }
         });
 
-        drop(apps);
-        drop(children);
-        drop(sys);
+        let has_changes = !exited_apps.is_empty() || !restart_ids.is_empty();
+        (restart_ids, has_changes)
+    };
+    // 锁已全部释放
 
-        if !exited_apps.is_empty() || !restart_ids.is_empty() {
-            save_apps_to_disk(&state);
-        }
+    if has_changes {
+        save_apps_to_disk(&state);
+    }
 
-        if !restart_ids.is_empty() {
-            std::thread::sleep(Duration::from_secs(2));
-            let mut apps = state.apps.lock().unwrap();
-            for rid in &restart_ids {
-                if let Some(instance) = apps.get_mut(rid) {
-                    if !instance.running {
-                        log_both(instance, &state.log_buffers, rid, "info", "退出自动重启：重新启动进程...");
-                        if spawn_and_track(instance, "自动重启", &state.children, &state.log_buffers, &state.job_object) {
-                            log_both(instance, &state.log_buffers, rid, "info", "退出自动重启成功");
-                        } else {
-                            log_both(instance, &state.log_buffers, rid, "error", "退出自动重启失败");
-                        }
+    if !restart_ids.is_empty() {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut apps = state.apps.lock().unwrap();
+        for rid in &restart_ids {
+            if let Some(instance) = apps.get_mut(rid) {
+                if !instance.running {
+                    push_to_buffer(&state.log_buffers, rid, "info", "退出自动重启：重新启动进程...");
+                    if spawn_and_track(instance, "自动重启", &state.children, &state.log_buffers, &state.job_object) {
+                        push_to_buffer(&state.log_buffers, rid, "info", "退出自动重启成功");
+                    } else {
+                        push_to_buffer(&state.log_buffers, rid, "error", "退出自动重启失败");
                     }
                 }
             }
-            drop(apps);
-            save_apps_to_disk(&state);
         }
+        drop(apps);
+        save_apps_to_disk(&state);
     }
 
     let apps = state.apps.lock().unwrap();
     let mut list: Vec<AppInstance> = apps.values().cloned().collect();
-    strip_logs(&mut list);
     list.sort_by_key(|a| a.config.sort_order);
     Ok(CommandResult::success(list))
 }
@@ -1725,6 +1690,7 @@ pub fn load_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<AppInst
             let mut buffers = state.log_buffers.lock().unwrap();
             for mut instance in data.apps {
                 let id = instance.config.id.clone();
+                instance.logs = None;
 
                 if instance.running {
                     match instance.config.app_type {
@@ -1853,41 +1819,44 @@ pub fn get_groups(state: State<'_, AppState>) -> Result<CommandResult<Vec<String
 }
 
 #[tauri::command]
-pub fn start_auto_start_apps(
+pub async fn start_auto_start_apps(
     state: State<'_, AppState>,
 ) -> Result<CommandResult<Vec<String>>, String> {
-    let mut apps = state.apps.lock().unwrap();
+    // 先在锁内收集启动计划，锁在块结束时释放
+    let plan: Vec<(String, u32)> = {
+        let apps = state.apps.lock().unwrap();
+        let mut sorted_ids: Vec<String> = apps
+            .iter()
+            .filter(|(_, i)| i.config.auto_start && !i.running)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        sorted_ids.sort_by(|a, b| {
+            let a_order = apps.get(a).map(|i| i.config.sort_order).unwrap_or(0);
+            let b_order = apps.get(b).map(|i| i.config.sort_order).unwrap_or(0);
+            a_order.cmp(&b_order)
+        });
+
+        sorted_ids
+            .into_iter()
+            .filter_map(|id| apps.get(&id).map(|i| (id, i.config.delay_seconds)))
+            .collect()
+    };
+
     let mut started = Vec::new();
+    for (id, delay) in plan {
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+        }
 
-    let mut sorted_ids: Vec<String> = apps
-        .iter()
-        .filter(|(_, i)| i.config.auto_start && !i.running)
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    sorted_ids.sort_by(|a, b| {
-        let a_order = apps.get(a).map(|i| i.config.sort_order).unwrap_or(0);
-        let b_order = apps.get(b).map(|i| i.config.sort_order).unwrap_or(0);
-        a_order.cmp(&b_order)
-    });
-
-    for id in sorted_ids {
+        let mut apps = state.apps.lock().unwrap();
         if let Some(instance) = apps.get_mut(&id) {
-            let delay = instance.config.delay_seconds;
-            if delay > 0 {
-                drop(apps);
-                std::thread::sleep(std::time::Duration::from_secs(delay as u64));
-                apps = state.apps.lock().unwrap();
-            }
-            if let Some(instance) = apps.get_mut(&id) {
-                if spawn_and_track(instance, "自动", &state.children, &state.log_buffers, &state.job_object) {
-                    started.push(instance.config.name.clone());
-                }
+            if spawn_and_track(instance, "自动", &state.children, &state.log_buffers, &state.job_object) {
+                started.push(instance.config.name.clone());
             }
         }
     }
 
-    drop(apps);
     save_apps_to_disk(&state);
     Ok(CommandResult::success(started))
 }

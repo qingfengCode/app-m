@@ -24,7 +24,7 @@ const systemInfo = ref<SystemInfo | null>(null)
 const isDark = ref(false)
 const lastRefreshTime = ref('')
 const viewMode = ref<'grid' | 'list'>('list')
-let refreshTimer: ReturnType<typeof setInterval> | null = null
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
 
 function toggleView() {
   viewMode.value = viewMode.value === 'list' ? 'grid' : 'list'
@@ -374,6 +374,15 @@ async function handleDialogSuccess() {
   await fetchGroups()
 }
 
+// 递归 setTimeout 轮询：上一次刷新完成后再调度下一次，避免慢请求重叠堆积
+async function scheduleRefresh() {
+  refreshTimer = setTimeout(async () => {
+    await refreshApps()
+    await fetchSystemInfo()
+    scheduleRefresh()
+  }, 3000)
+}
+
 onMounted(async () => {
   initTheme()
   await loadFromDisk()
@@ -382,15 +391,12 @@ onMounted(async () => {
   await fetchSystemInfo()
   await fetchGroups()
 
-  refreshTimer = setInterval(() => {
-    refreshApps()
-    fetchSystemInfo()
-  }, 3000)
+  scheduleRefresh()
 })
 
 onUnmounted(() => {
   if (refreshTimer) {
-    clearInterval(refreshTimer)
+    clearTimeout(refreshTimer)
     refreshTimer = null
   }
 })

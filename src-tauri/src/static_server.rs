@@ -72,7 +72,7 @@ struct ServerState {
 }
 
 fn sanitize_path(path: &str, root: &PathBuf) -> Option<PathBuf> {
-    let decoded = percent_decode(path);
+    let decoded = percent_decode(path)?;
     let file_path = root.join(&decoded);
     match file_path.canonicalize() {
         Ok(canonical) => {
@@ -86,25 +86,29 @@ fn sanitize_path(path: &str, root: &PathBuf) -> Option<PathBuf> {
     }
 }
 
-fn percent_decode(input: &str) -> String {
+/// 解码 URL 编码路径。`+` 按空格处理，`%XX` 转义为对应字节；
+/// 解码结果不是合法 UTF-8 时返回 `None`（由调用方拒绝请求，避免回退到根目录）。
+fn percent_decode(input: &str) -> Option<String> {
     let mut result = Vec::new();
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                &String::from_utf8_lossy(&bytes[i + 1..i + 3]),
-                16,
-            ) {
+            let hex = String::from_utf8_lossy(&bytes[i + 1..i + 3]);
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
                 result.push(byte);
                 i += 3;
                 continue;
             }
         }
-        result.push(bytes[i]);
+        if bytes[i] == b'+' {
+            result.push(b' ');
+        } else {
+            result.push(bytes[i]);
+        }
         i += 1;
     }
-    String::from_utf8(result).unwrap_or_default()
+    String::from_utf8(result).ok()
 }
 
 fn match_proxy_rule<'a>(path: &str, rules: &'a [ProxyRule]) -> Option<&'a ProxyRule> {
