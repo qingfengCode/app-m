@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { MoreFilled, Edit, Delete, VideoPlay, SwitchButton, CloseBold, Document, RefreshRight, Link, TrendCharts, CopyDocument } from '@element-plus/icons-vue'
+import { MoreFilled, Edit, Delete, VideoPlay, SwitchButton, CloseBold, Document, RefreshRight, Link, TrendCharts, CopyDocument, Loading } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import type { AppInstance } from '../App'
@@ -94,7 +94,7 @@ async function openInBrowser() {
     @dragover.prevent
     @drop.prevent.stop="emit('drop', app.config.id)"
   >
-    <span class="dot" :class="{ on: app.running }" />
+    <span class="dot" :class="{ on: app.running, closing: app.stopping }" />
 
     <span class="color-bar" v-if="app.config.color" :style="{ background: app.config.color }" />
 
@@ -137,6 +137,10 @@ async function openInBrowser() {
     <div class="col-actions">
       <template v-if="!app.running">
         <button class="btn start" @click="emit('start', app.config.id)"><el-icon><VideoPlay /></el-icon></button>
+      </template>
+      <template v-else-if="app.stopping">
+        <span class="closing-text" title="正在关闭..."><el-icon class="is-loading"><Loading /></el-icon></span>
+        <button class="btn kill" v-if="!isStaticServer" @click="handleForceStop" title="强制关闭"><el-icon><CloseBold /></el-icon></button>
       </template>
       <template v-else>
         <button class="btn stop" @click="handleStop" title="关闭"><el-icon><SwitchButton /></el-icon></button>
@@ -214,6 +218,11 @@ html.dark .list-item {
     background: #52c41a;
     box-shadow: 0 0 4px rgba(82, 196, 26, 0.5);
     animation: pulse 2s infinite;
+  }
+  &.closing {
+    background: #e6a23c;
+    box-shadow: 0 0 4px rgba(230, 162, 60, 0.5);
+    animation: pulse 1s infinite;
   }
 }
 
@@ -329,6 +338,15 @@ html.dark .col-type .badge { background: rgba(64, 158, 255, 0.1); &.static { bac
   gap: 2px;
   flex-shrink: 0;
   margin-left: auto;
+}
+
+.closing-text {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--el-color-warning);
 }
 
 .btn {

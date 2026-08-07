@@ -91,6 +91,12 @@ pub struct AppInstance {
     pub exit_reason: Option<String>,
     #[serde(skip)]
     pub manual_stop: bool,
+    /// 已发送停止信号、等待进程退出；后台刷新检测到进程退出后清除
+    #[serde(skip)]
+    pub stopping: bool,
+    /// 发送停止信号的时刻（Unix 秒），用于关闭超时检测
+    #[serde(skip)]
+    pub stop_requested_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

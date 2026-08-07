@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { MoreFilled, Edit, Delete, VideoPlay, SwitchButton, CloseBold, Document, RefreshRight, Link, TrendCharts, CopyDocument } from '@element-plus/icons-vue'
+import { MoreFilled, Edit, Delete, VideoPlay, SwitchButton, CloseBold, Document, RefreshRight, Link, TrendCharts, CopyDocument, Loading } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import type { AppInstance } from '../App'
@@ -32,7 +32,7 @@ const monitorVisible = ref(false)
 const isStaticServer = computed(() => props.app.config.app_type === 'StaticServer')
 const appTypeText = computed(() => isStaticServer.value ? '静态' : '命令')
 
-const statusDot = computed(() => props.app.running ? 'running' : 'stopped')
+const statusDot = computed(() => props.app.stopping ? 'closing' : (props.app.running ? 'running' : 'stopped'))
 
 const cpuText = computed(() => {
   if (!props.app.process_info) return '-'
@@ -149,6 +149,10 @@ async function openInBrowser() {
       <template v-if="!app.running">
         <button class="btn start" @click="emit('start', app.config.id)"><el-icon><VideoPlay /></el-icon> 启动</button>
       </template>
+      <template v-else-if="app.stopping">
+        <span class="closing-text"><el-icon class="is-loading"><Loading /></el-icon> 正在关闭...</span>
+        <button class="btn kill" v-if="!isStaticServer" @click="handleForceStop"><el-icon><CloseBold /></el-icon></button>
+      </template>
       <template v-else>
         <button class="btn stop" @click="handleStop"><el-icon><SwitchButton /></el-icon> 关闭</button>
         <button class="btn kill" v-if="!isStaticServer" @click="handleForceStop"><el-icon><CloseBold /></el-icon></button>
@@ -259,6 +263,11 @@ html.dark .app-card {
       animation: pulse 2s infinite;
     }
     &.stopped { background: #d4d4d4; }
+    &.closing {
+      background: #e6a23c;
+      box-shadow: 0 0 5px rgba(230, 162, 60, 0.5);
+      animation: pulse 1s infinite;
+    }
   }
 
   .app-name {
@@ -397,6 +406,14 @@ html.dark .exit-banner { background: rgba(250, 173, 20, 0.08); }
 }
 
 .grow { flex: 1; }
+
+.closing-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--el-color-warning);
+}
 
 .btn {
   border: none;

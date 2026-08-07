@@ -57,6 +57,8 @@ export interface AppInstance {
   logs: LogEntry[] | null
   server_port: number | null
   exit_reason: string | null
+  /** 已发送停止信号、等待进程退出 */
+  stopping: boolean
 }
 
 export interface CommandResult<T> {

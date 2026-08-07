@@ -17,6 +17,9 @@ use tauri::AppHandle;
 use tauri::Manager;
 use tauri::State;
 
+/// 发送停止信号后，等待进程退出的超时秒数；超时后恢复可操作状态并提示
+const CLOSE_TIMEOUT_SECS: i64 = 15;
+
 fn get_data_file_path(state: &State<'_, AppState>) -> String {
     let dir = state.app_data_dir.lock().unwrap().clone();
     std::path::Path::new(&dir)
@@ -195,6 +198,8 @@ fn spawn_and_track(
             instance.started_at = Some(now);
             instance.exit_reason = None;
             instance.manual_stop = false;
+            instance.stopping = false;
+            instance.stop_requested_at = None;
 
             if let Err(e) = job_object.assign_process(&mut child) {
                 eprintln!("警告: 无法将进程 {} 分配到 Job Object: {}", pid, e);
@@ -473,6 +478,8 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
                                         inst.started_at = None;
                                         inst.server_port = None;
                                         inst.exit_reason = None;
+                                        inst.stopping = false;
+                                        inst.stop_requested_at = None;
                                     }
                                 }
                                 std::thread::sleep(Duration::from_millis(300));
@@ -487,6 +494,8 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
                                         inst.process_info = None;
                                         inst.started_at = None;
                                         inst.exit_reason = Some("文件变更自动重启".to_string());
+                                        inst.stopping = false;
+                                        inst.stop_requested_at = None;
                                     }
                                 }
                                 kill_child(&state.children, &watch_id, true, None);
@@ -597,6 +606,8 @@ pub fn add_app(
         server_port: None,
         exit_reason: None,
         manual_stop: false,
+        stopping: false,
+        stop_requested_at: None,
     };
 
     let id = config.id.clone();
@@ -784,39 +795,83 @@ pub async fn stop_app(
                 push_to_buffer(&state.log_buffers, &id, "info", "静态服务器已停止");
             }
             AppType::Command => {
-                push_to_buffer(&state.log_buffers, &id, "info", if force { "强制终止进程" } else { "终止进程" });
+                if force {
+                    push_to_buffer(&state.log_buffers, &id, "info", "强制终止进程");
+                    let real_pid = instance.pid;
+                    drop(apps);
+
+                    let killed = kill_child(&state.children, &id, true, real_pid);
+
+                    let mut apps = state.apps.lock().unwrap();
+                    if let Some(instance) = apps.get_mut(&id) {
+                        if killed || force {
+                            instance.running = false;
+                            instance.pid = None;
+                            instance.process_info = None;
+                            instance.started_at = None;
+                            instance.stopping = false;
+                            instance.stop_requested_at = None;
+                            instance.exit_reason = Some("手动强制关闭".to_string());
+                            instance.manual_stop = true;
+                            push_to_buffer(&state.log_buffers, &id, "info", "已强制关闭");
+                        } else {
+                            push_to_buffer(&state.log_buffers, &id, "error", "关闭失败");
+                        }
+                    }
+                    drop(apps);
+                    state.children.lock().unwrap().remove(&id);
+                    stop_file_watcher(&state, &id);
+                    save_apps_to_disk(&state);
+
+                    if killed || force {
+                        return Ok(CommandResult {
+                            code: 0,
+                            data: None,
+                            msg: "已强制关闭".to_string(),
+                        });
+                    }
+                    return Ok(CommandResult::error("关闭失败"));
+                }
+
+                // 普通关闭：仅向进程发送停止信号（WM_CLOSE / SIGTERM），不等待、不强杀；
+                // 由后台刷新检测到进程退出后，再将状态更新为"已关闭"
+                push_to_buffer(&state.log_buffers, &id, "info", "正在发送关闭信号...");
                 let real_pid = instance.pid;
                 drop(apps);
 
-                let killed = kill_child(&state.children, &id, force, real_pid);
-
-                let mut apps = state.apps.lock().unwrap();
-                if let Some(instance) = apps.get_mut(&id) {
-                    if killed || force {
-                        instance.running = false;
-                        instance.pid = None;
-                        instance.process_info = None;
-                        instance.started_at = None;
-                        instance.exit_reason = Some(if force { "手动强制关闭".to_string() } else { "手动关闭".to_string() });
-                        instance.manual_stop = true;
-                        push_to_buffer(&state.log_buffers, &id, "info", if force { "已强制关闭" } else { "已关闭" });
-                    } else {
-                        push_to_buffer(&state.log_buffers, &id, "error", "关闭失败");
+                match real_pid {
+                    Some(pid) if kill_gracefully(pid) => {
+                        let now = now_ts();
+                        {
+                            let mut apps = state.apps.lock().unwrap();
+                            if let Some(instance) = apps.get_mut(&id) {
+                                instance.stopping = true;
+                                instance.stop_requested_at = Some(now);
+                                instance.manual_stop = true;
+                            }
+                        }
+                        push_to_buffer(
+                            &state.log_buffers,
+                            &id,
+                            "info",
+                            &format!("已向 PID {} 发送关闭信号，等待进程退出", pid),
+                        );
+                        stop_file_watcher(&state, &id);
+                        save_apps_to_disk(&state);
+                        return Ok(CommandResult {
+                            code: 0,
+                            data: None,
+                            msg: "已发送关闭信号，等待进程退出".to_string(),
+                        });
                     }
+                    Some(_) => {
+                        push_to_buffer(&state.log_buffers, &id, "error", "无法向进程发送关闭信号");
+                        return Ok(CommandResult::error(
+                            "无法向进程发送关闭信号（进程可能没有窗口），请使用强制关闭",
+                        ));
+                    }
+                    None => return Ok(CommandResult::error("无法获取进程 PID")),
                 }
-                drop(apps);
-                state.children.lock().unwrap().remove(&id);
-                stop_file_watcher(&state, &id);
-                save_apps_to_disk(&state);
-
-                if killed || force {
-                    return Ok(CommandResult {
-                        code: 0,
-                        data: None,
-                        msg: if force { "已强制关闭".to_string() } else { "已关闭".to_string() },
-                    });
-                }
-                return Ok(CommandResult::error("关闭失败"));
             }
         }
     }
@@ -864,6 +919,8 @@ pub async fn restart_app(
                         instance.process_info = None;
                         instance.started_at = None;
                         instance.exit_reason = Some("重启".to_string());
+                        instance.stopping = false;
+                        instance.stop_requested_at = None;
                     }
                     AppType::StaticServer => {
                         push_to_buffer(&state.log_buffers, &id, "info", "重启：停止静态服务器");
@@ -873,6 +930,8 @@ pub async fn restart_app(
                         instance.started_at = None;
                         instance.server_port = None;
                         instance.exit_reason = Some("重启".to_string());
+                        instance.stopping = false;
+                        instance.stop_requested_at = None;
                     }
                 }
             }
@@ -1378,6 +1437,8 @@ pub async fn stop_all_apps(state: State<'_, AppState>) -> Result<CommandResult<V
             instance.server_port = None;
             instance.exit_reason = Some("批量关闭".to_string());
             instance.manual_stop = true;
+            instance.stopping = false;
+            instance.stop_requested_at = None;
             push_to_buffer(&state.log_buffers, id, "info", "批量关闭");
             stopped.push(instance.config.name.clone());
         }
@@ -1490,6 +1551,24 @@ pub async fn refresh_all(
                         });
                         instance.running = true;
 
+                        // 关闭中：检测超时，超时未退出则恢复可操作状态并提示
+                        if instance.stopping {
+                            let timeout = instance
+                                .stop_requested_at
+                                .map(|t| now_ts() - t > CLOSE_TIMEOUT_SECS)
+                                .unwrap_or(true);
+                            if timeout {
+                                instance.stopping = false;
+                                instance.stop_requested_at = None;
+                                push_to_buffer(
+                                    &state.log_buffers,
+                                    id,
+                                    "warn",
+                                    "已发送关闭信号但进程仍未退出，可尝试强制关闭",
+                                );
+                            }
+                        }
+
                         let monitoring = *state.monitoring_enabled.lock().unwrap();
                         if monitoring {
                             let ts = now_ts();
@@ -1527,7 +1606,8 @@ pub async fn refresh_all(
                     } else {
                         let mut exit_msg = "进程已退出".to_string();
                         let should_auto_restart = instance.config.exit_restart
-                            && matches!(instance.config.app_type, AppType::Command);
+                            && matches!(instance.config.app_type, AppType::Command)
+                            && !instance.stopping;
 
                         if let Some(child) = children.get_mut(id) {
                             match child.try_wait() {
@@ -1549,14 +1629,24 @@ pub async fn refresh_all(
                             }
                         }
 
+                        if instance.stopping {
+                            exit_msg = "已关闭".to_string();
+                        }
+
                         if instance.running {
-                            push_to_buffer(&state.log_buffers, id, "warn", &exit_msg);
-                            exited_apps.push(instance.config.name.clone());
+                            if instance.stopping {
+                                push_to_buffer(&state.log_buffers, id, "info", "进程已退出，关闭完成");
+                            } else {
+                                push_to_buffer(&state.log_buffers, id, "warn", &exit_msg);
+                                exited_apps.push(instance.config.name.clone());
+                            }
                         }
                         instance.running = false;
                         instance.pid = None;
                         instance.process_info = None;
                         instance.started_at = None;
+                        instance.stopping = false;
+                        instance.stop_requested_at = None;
                         instance.exit_reason = if should_auto_restart {
                             Some(format!("{} (自动重启中...)", exit_msg))
                         } else {
