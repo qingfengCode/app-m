@@ -131,7 +131,7 @@ async function openInBrowser() {
     </div>
 
     <div class="col-url" v-if="serverUrl && app.running">
-      <a :href="serverUrl" target="_blank" @click.stop>{{ serverUrl }}</a>
+      <a @click.prevent="openInBrowser">{{ serverUrl }}</a>
     </div>
 
     <div class="col-actions">
@@ -329,6 +329,7 @@ html.dark .col-type .badge { background: rgba(64, 158, 255, 0.1); &.static { bac
     font-size: 11px;
     color: var(--el-color-primary);
     text-decoration: none;
+    cursor: pointer;
     &:hover { text-decoration: underline; }
   }
 }

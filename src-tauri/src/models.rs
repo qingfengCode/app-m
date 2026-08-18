@@ -92,7 +92,7 @@ pub struct AppInstance {
     #[serde(skip)]
     pub manual_stop: bool,
     /// 已发送停止信号、等待进程退出；后台刷新检测到进程退出后清除
-    #[serde(skip)]
+    #[serde(default)]
     pub stopping: bool,
     /// 发送停止信号的时刻（Unix 秒），用于关闭超时检测
     #[serde(skip)]

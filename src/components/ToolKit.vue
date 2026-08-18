@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+
+defineOptions({ name: 'ToolKit' })
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Delete, Position, RefreshRight, Plus } from '@element-plus/icons-vue'
 import type { CommandResult, ProcessItem, PortMapping, HostsEntry } from '../App'
@@ -347,10 +349,6 @@ function handleClose() {
     </template>
   </el-dialog>
 </template>
-
-<script lang="ts">
-export default { name: 'ToolKit' }
-</script>
 
 <style scoped lang="scss">
 :deep(.el-dialog__header) {

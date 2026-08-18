@@ -86,8 +86,9 @@ fn sanitize_path(path: &str, root: &PathBuf) -> Option<PathBuf> {
     }
 }
 
-/// 解码 URL 编码路径。`+` 按空格处理，`%XX` 转义为对应字节；
+/// 解码 URL 编码路径。`%XX` 转义为对应字节；
 /// 解码结果不是合法 UTF-8 时返回 `None`（由调用方拒绝请求，避免回退到根目录）。
+/// 注意：路径段中的 `+` 按 RFC 3986 为字面量，不做空格解码（仅表单编码的 query 中 `+` 表示空格）。
 fn percent_decode(input: &str) -> Option<String> {
     let mut result = Vec::new();
     let bytes = input.as_bytes();
@@ -101,11 +102,7 @@ fn percent_decode(input: &str) -> Option<String> {
                 continue;
             }
         }
-        if bytes[i] == b'+' {
-            result.push(b' ');
-        } else {
-            result.push(bytes[i]);
-        }
+        result.push(bytes[i]);
         i += 1;
     }
     String::from_utf8(result).ok()
@@ -414,12 +411,15 @@ async fn proxy_request(rule: &ProxyRule, req: Request, client: &reqwest::Client)
         }
     }
 
-    let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024).await;
-
-    if let Ok(bytes) = body_bytes {
-        if !bytes.is_empty() {
-            req_builder = req_builder.body(bytes);
+    let body_bytes = match axum::body::to_bytes(body, 50 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "请求体超过 50MB 限制").into_response();
         }
+    };
+
+    if !body_bytes.is_empty() {
+        req_builder = req_builder.body(body_bytes);
     }
 
     match req_builder.send().await {

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, watch, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+
+defineOptions({ name: 'MonitorChart' })
 import { ElSwitch, ElMessage } from 'element-plus'
 import type { CommandResult, MetricPoint } from '../App'
 
@@ -29,7 +31,9 @@ async function fetchMonitoringState() {
     if (res.code === 0 && res.data !== null) {
       monitoringOn.value = res.data
     }
-  } catch {}
+  } catch (e) {
+    console.error('获取监控状态失败', e)
+  }
 }
 
 async function toggleMonitoring(val: string | number | boolean) {
@@ -57,7 +61,9 @@ async function fetchMetrics() {
       metrics.value = res.data.filter(p => p.ts >= cutoff)
       drawChart()
     }
-  } catch {}
+  } catch (e) {
+    console.error('获取监控数据失败', e)
+  }
 }
 
 function formatBytes(v: number): string {
@@ -298,10 +304,6 @@ function handleClose() {
     </template>
   </el-dialog>
 </template>
-
-<script lang="ts">
-export default { name: 'MonitorChart' }
-</script>
 
 <style scoped lang="scss">
 :deep(.el-dialog__header) {

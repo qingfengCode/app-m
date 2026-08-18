@@ -82,6 +82,7 @@ export interface AddAppParams {
   url?: string | null
   watch_restart?: boolean | null
   watch_dirs?: string[] | null
+  exit_restart?: boolean | null
 }
 
 export interface UpdateAppParams {
@@ -100,6 +101,7 @@ export interface UpdateAppParams {
   url?: string | null
   watch_restart?: boolean | null
   watch_dirs?: string[] | null
+  exit_restart?: boolean | null
 }
 
 export interface SystemInfo {
@@ -140,22 +142,4 @@ export interface HostsEntry {
   enabled: boolean
   original_line: string
   line_number: number
-}
-
-export class indexTypes {
-  static AppConfig: AppConfig = {} as AppConfig
-  static ProcessInfo: ProcessInfo = {} as ProcessInfo
-  static LogEntry: LogEntry = {} as LogEntry
-  static AppInstance: AppInstance = {} as AppInstance
-  static CommandResult: CommandResult<unknown> = {} as CommandResult<unknown>
-  static AddAppParams: AddAppParams = {} as AddAppParams
-  static UpdateAppParams: UpdateAppParams = {} as UpdateAppParams
-  static SystemInfo: SystemInfo = {} as SystemInfo
-  static AppType: AppType = 'Command' as AppType
-  static ProxyRule: ProxyRule = {} as ProxyRule
-  static StaticServerConfig: StaticServerConfig = {} as StaticServerConfig
-  static ProcessItem: ProcessItem = {} as ProcessItem
-  static PortMapping: PortMapping = {} as PortMapping
-  static MetricPoint: MetricPoint = {} as MetricPoint
-  static HostsEntry: HostsEntry = {} as HostsEntry
 }

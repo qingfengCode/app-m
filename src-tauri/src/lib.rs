@@ -21,6 +21,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // 单实例：窗口关闭只是隐藏到托盘，防止用户再次启动快捷方式时出现第二个进程
+        // 同时操作同一份配置文件互相覆盖，导致配置"丢失"
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(|app| {
             let home = app
                 .path()

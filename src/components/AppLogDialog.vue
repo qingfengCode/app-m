@@ -74,15 +74,77 @@ function levelClass(level: string) {
   }
 }
 
-watch(() => props.visible, (val) => {
-  if (val && props.app) {
-    fetchLogs(true)
+// 16 色基础色板（映射 ANSI 30-37 / 90-97 / 40-47 / 100-107）
+const ANSI_PALETTE = [
+  '#000000', '#800000', '#008000', '#808000',
+  '#000080', '#800080', '#008080', '#c0c0c0',
+  '#808080', '#ff0000', '#00ff00', '#ffff00',
+  '#0000ff', '#ff00ff', '#00ffff', '#ffffff'
+]
+
+function ansi256Color(n: number): string {
+  if (n < 16) return ANSI_PALETTE[n]
+  if (n < 232) {
+    // 6x6x6 彩色立方体
+    const idx = n - 16
+    const r = Math.floor(idx / 36)
+    const g = Math.floor((idx % 36) / 6)
+    const b = idx % 6
+    const conv = (v: number) => (v === 0 ? 0 : 55 + v * 40)
+    return `rgb(${conv(r)},${conv(g)},${conv(b)})`
   }
-})
+  // 灰度
+  const g = 8 + (n - 232) * 10
+  return `rgb(${g},${g},${g})`
+}
+
+const ANSI_SGR = /\x1b\[([0-9;]*)m/g
+
+/**
+ * 将 ANSI 转义序列转换为彩色 HTML。
+ * 先转义 HTML 实体再注入受控的 <span>，避免子进程输出被当作 HTML 注入。
+ */
+function ansiToHtml(text: string): string {
+  let html = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  let opened = 0
+  html = html.replace(ANSI_SGR, (_m, codes: string) => {
+    const nums = codes ? codes.split(';').map(Number) : [0]
+    if (nums.includes(0)) {
+      // 重置：关闭所有已打开的 span
+      const close = '</span>'.repeat(opened)
+      opened = 0
+      return close
+    }
+    let style = ''
+    let i = 0
+    while (i < nums.length) {
+      const n = nums[i]
+      if (n === 1) style += 'font-weight:bold;'
+      else if (n === 2) style += 'opacity:.65;'
+      else if (n === 3) style += 'font-style:italic;'
+      else if (n === 4) style += 'text-decoration:underline;'
+      else if (n === 9) style += 'text-decoration:line-through;'
+      else if (n === 38 && nums[i + 1] === 5) { style += `color:${ansi256Color(nums[i + 2])};`; i += 2 }
+      else if (n === 38 && nums[i + 1] === 2) { style += `color:rgb(${nums[i + 2]},${nums[i + 3]},${nums[i + 4]});`; i += 4 }
+      else if (n === 48 && nums[i + 1] === 5) { style += `background-color:${ansi256Color(nums[i + 2])};`; i += 2 }
+      else if (n === 48 && nums[i + 1] === 2) { style += `background-color:rgb(${nums[i + 2]},${nums[i + 3]},${nums[i + 4]});`; i += 4 }
+      else if (n >= 30 && n <= 37) style += `color:${ANSI_PALETTE[n - 30]};`
+      else if (n >= 90 && n <= 97) style += `color:${ANSI_PALETTE[n - 90 + 8]};`
+      else if (n >= 40 && n <= 47) style += `background-color:${ANSI_PALETTE[n - 40]};`
+      else if (n >= 100 && n <= 107) style += `background-color:${ANSI_PALETTE[n - 100 + 8]};`
+      i++
+    }
+    if (!style) return ''
+    opened++
+    return `<span style="${style}">`
+  })
+  return html + '</span>'.repeat(opened)
+}
 
 let logTimer: ReturnType<typeof setInterval> | null = null
 watch(() => props.visible, (val) => {
   if (val) {
+    if (props.app) fetchLogs(true)
     logTimer = setInterval(fetchLogs, 2000)
   } else {
     if (logTimer) {
@@ -123,7 +185,7 @@ function handleClose() {
       >
         <span class="log-time">{{ formatTime(log.timestamp) }}</span>
         <span class="log-level">[{{ log.level.toUpperCase() }}]</span>
-        <span class="log-content">{{ log.content }}</span>
+        <span class="log-content" v-html="ansiToHtml(log.content)"></span>
       </div>
     </div>
 

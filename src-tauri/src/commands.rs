@@ -7,7 +7,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind, Confi
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -28,8 +28,24 @@ fn get_data_file_path(state: &State<'_, AppState>) -> String {
         .to_string()
 }
 
+/// 追加写入错误日志（release 版无控制台，写文件才能排查问题）
+fn log_error(state: &State<'_, AppState>, msg: &str) {
+    let dir = state.app_data_dir.lock().unwrap().clone();
+    let path = std::path::Path::new(&dir).join("error.log");
+    let line = format!("[{}] {}\n", now_ts(), msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 fn save_apps_to_disk(state: &State<'_, AppState>) {
-    let path = get_data_file_path(state);
+    let dir = state.app_data_dir.lock().unwrap().clone();
+    let path = std::path::Path::new(&dir).join("apps.json");
+    let tmp_path = std::path::Path::new(&dir).join("apps.json.tmp");
     let apps = state.apps.lock().unwrap();
     let mut instances: Vec<AppInstance> = apps.values().map(|i| {
         let mut inst = i.clone();
@@ -39,8 +55,18 @@ fn save_apps_to_disk(state: &State<'_, AppState>) {
     }).collect();
     instances.sort_by_key(|a| a.config.sort_order);
     let data = PersistData { apps: instances };
-    if let Ok(json) = serde_json::to_string_pretty(&data) {
-        let _ = fs::write(&path, json);
+    match serde_json::to_string_pretty(&data) {
+        Ok(json) => {
+            // 先写临时文件再原子替换：避免进程被强杀时留下损坏的 apps.json
+            if let Err(e) = fs::write(&tmp_path, json) {
+                log_error(state, &format!("写入临时配置失败: {}", e));
+            } else if let Err(e) = fs::rename(&tmp_path, &path) {
+                log_error(state, &format!("替换配置文件失败: {}", e));
+            }
+        }
+        Err(e) => {
+            log_error(state, &format!("序列化配置失败: {}", e));
+        }
     }
 }
 
@@ -49,6 +75,16 @@ fn now_ts() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// 重置实例的运行相关状态（config 与 exit_reason 由调用方按语义设置）
+fn reset_instance_running_state(instance: &mut AppInstance) {
+    instance.running = false;
+    instance.pid = None;
+    instance.process_info = None;
+    instance.started_at = None;
+    instance.stopping = false;
+    instance.stop_requested_at = None;
 }
 
 const MAX_LOGS: usize = 2000;
@@ -253,6 +289,28 @@ fn spawn_and_track(
     }
 }
 
+/// 在持有 apps 锁时调用会导致 resolve_real_process 最长阻塞 1.5 秒，
+/// 阻塞所有其他命令（含 UI 轮询）。此函数将实例移出 map 后在锁外执行 spawn，
+/// 完成后写回，避免长阻塞。
+fn spawn_and_track_unlocked(state: &State<'_, AppState>, id: &str, tag: &str) -> bool {
+    let mut instance = {
+        let mut apps = state.apps.lock().unwrap();
+        match apps.remove(id) {
+            Some(inst) => inst,
+            None => return false,
+        }
+    };
+    let ok = spawn_and_track(
+        &mut instance,
+        tag,
+        &state.children,
+        &state.log_buffers,
+        &state.job_object,
+    );
+    state.apps.lock().unwrap().insert(id.to_string(), instance);
+    ok
+}
+
 pub fn kill_tree(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -348,16 +406,23 @@ fn kill_child(
             // 强制关闭：递归终止整棵进程树
             let tree_killed = kill_tree(pid);
             let _ = child.kill();
-            tree_killed
+            if tree_killed {
+                true
+            } else {
+                // taskkill 可能报告失败但进程已实际退出，以存活状态为准
+                !is_process_alive(pid)
+            }
         } else {
             // 关闭：先向真实进程发送优雅关闭信号并等待其退出；
             // 超时未退出或无法发送信号时，回退为强制终止单个进程（不递归树杀）
             let target = real_pid.unwrap_or(pid);
             if kill_gracefully(target) {
                 let deadline = Instant::now() + Duration::from_millis(1500);
+                let mut sys = sysinfo::System::new();
                 while Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(150));
-                    if !is_process_alive(target) {
+                    sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(target)]), false);
+                    if sys.process(Pid::from_u32(target)).is_none() {
                         return true;
                     }
                 }
@@ -366,6 +431,10 @@ fn kill_child(
             let _ = kill_process(target);
             !is_process_alive(target)
         }
+    } else if force {
+        // 缺少 Child 句柄（如进程由上次会话遗留、load_apps 只恢复了 pid）时，
+        // 直接按真实 PID 终止进程树，避免误报"已强制关闭"
+        real_pid.map(kill_tree).unwrap_or(false)
     } else {
         false
     }
@@ -472,14 +541,9 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
                                     let mut apps_map = state.apps.lock().unwrap();
                                     if let Some(inst) = apps_map.get_mut(&watch_id) {
                                         push_to_buffer(&state.log_buffers, &watch_id, "info", "文件变更，准备自动重启...");
-                                        inst.running = false;
-                                        inst.pid = None;
-                                        inst.process_info = None;
-                                        inst.started_at = None;
+                                        reset_instance_running_state(inst);
                                         inst.server_port = None;
                                         inst.exit_reason = None;
-                                        inst.stopping = false;
-                                        inst.stop_requested_at = None;
                                     }
                                 }
                                 std::thread::sleep(Duration::from_millis(300));
@@ -489,13 +553,8 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
                                     let mut apps_map = state.apps.lock().unwrap();
                                     if let Some(inst) = apps_map.get_mut(&watch_id) {
                                         push_to_buffer(&state.log_buffers, &watch_id, "info", "文件变更，准备自动重启...");
-                                        inst.running = false;
-                                        inst.pid = None;
-                                        inst.process_info = None;
-                                        inst.started_at = None;
+                                        reset_instance_running_state(inst);
                                         inst.exit_reason = Some("文件变更自动重启".to_string());
-                                        inst.stopping = false;
-                                        inst.stop_requested_at = None;
                                     }
                                 }
                                 kill_child(&state.children, &watch_id, true, None);
@@ -506,16 +565,19 @@ fn start_file_watcher(state: &State<'_, AppState>, app: &AppHandle, id: &str) {
 
                         match app_type {
                             AppType::Command => {
-                                let mut apps_map = state.apps.lock().unwrap();
-                                if let Some(inst) = apps_map.get_mut(&watch_id) {
-                                    if spawn_and_track(inst, "自动重启", &state.children, &state.log_buffers, &state.job_object) {
-                                        push_to_buffer(&state.log_buffers, &watch_id, "info", "文件变更自动重启成功");
-                                    } else {
-                                        push_to_buffer(&state.log_buffers, &watch_id, "error", "文件变更自动重启失败");
-                                    }
+                                if spawn_and_track_unlocked(&state, &watch_id, "自动重启") {
+                                    push_to_buffer(&state.log_buffers, &watch_id, "info", "文件变更自动重启成功");
+                                } else {
+                                    push_to_buffer(&state.log_buffers, &watch_id, "error", "文件变更自动重启失败");
                                 }
                             }
                             AppType::StaticServer => {
+                                // 先停止旧服务器任务并释放端口，否则同端口重新 bind 必然失败
+                                if let Some(handle) = state.running_servers.lock().unwrap().remove(&watch_id) {
+                                    handle.abort();
+                                }
+                                // 等待旧任务退出、端口释放
+                                std::thread::sleep(Duration::from_millis(150));
                                 let sc_clone;
                                 let port;
                                 {
@@ -590,6 +652,9 @@ pub fn add_app(
         if sc.root_dir.is_empty() {
             return Ok(CommandResult::error("静态文件目录不能为空"));
         }
+        if sc.port == 0 {
+            return Ok(CommandResult::error("端口号无效"));
+        }
     }
 
     let sort_order = state.alloc_sort_order();
@@ -648,6 +713,12 @@ pub fn update_app(
         instance.config.group = params.group;
         instance.config.env_vars = params.env_vars;
         instance.config.delay_seconds = params.delay_seconds.unwrap_or(0);
+        // 静态服务器端口校验（port=0 会绑定随机端口，导致 UI 显示端口与实际不符）
+        if let Some(sc) = &params.static_server {
+            if sc.port == 0 {
+                return Ok(CommandResult::error("端口号无效"));
+            }
+        }
         instance.config.static_server = params.static_server;
         instance.config.url = params.url;
         instance.config.watch_restart = params.watch_restart.unwrap_or(false);
@@ -702,8 +773,8 @@ pub async fn start_app(
     app: AppHandle,
     id: String,
 ) -> Result<CommandResult<String>, String> {
-    // 第一阶段：锁内确认状态并启动/收集数据，锁在块结束时释放
-    let (pid, sc_clone): (Option<u32>, Option<StaticServerConfig>) = {
+    // 第一阶段：锁内确认状态并收集配置，锁在块结束时释放
+    let app_type = {
         let mut apps = state.apps.lock().unwrap();
         let Some(instance) = apps.get_mut(&id) else {
             return Ok(CommandResult::error("应用不存在"));
@@ -713,30 +784,28 @@ pub async fn start_app(
             return Ok(CommandResult::error("应用已经在运行中"));
         }
 
-        match instance.config.app_type {
-            AppType::Command => {
-                if spawn_and_track(instance, "", &state.children, &state.log_buffers, &state.job_object) {
-                    (Some(instance.pid.unwrap()), None)
-                } else {
-                    return Ok(CommandResult::error("启动失败"));
-                }
-            }
-            AppType::StaticServer => match &instance.config.static_server {
-                Some(sc) => (None, Some(sc.clone())),
-                None => return Ok(CommandResult::error("缺少静态服务器配置")),
-            },
-        }
+        instance.config.app_type.clone()
     };
 
-    // 锁已释放
-    if let Some(pid) = pid {
-        save_apps_to_disk(&state);
-        start_file_watcher(&state, &app, &id);
-        return Ok(CommandResult::success(pid.to_string()));
+    if app_type == AppType::Command {
+        // 锁外启动：避免 resolve_real_process 在锁内长阻塞
+        if spawn_and_track_unlocked(&state, &id, "") {
+            let pid = state.apps.lock().unwrap().get(&id).and_then(|i| i.pid);
+            if let Some(pid) = pid {
+                save_apps_to_disk(&state);
+                start_file_watcher(&state, &app, &id);
+                return Ok(CommandResult::success(pid.to_string()));
+            }
+        }
+        return Ok(CommandResult::error("启动失败"));
     }
 
-    let Some(sc) = sc_clone else {
-        return Ok(CommandResult::error("缺少静态服务器配置"));
+    let sc = {
+        let apps = state.apps.lock().unwrap();
+        let Some(sc) = apps.get(&id).and_then(|i| i.config.static_server.clone()) else {
+            return Ok(CommandResult::error("缺少静态服务器配置"));
+        };
+        sc
     };
     let port = sc.port;
 
@@ -801,36 +870,26 @@ pub async fn stop_app(
                     drop(apps);
 
                     let killed = kill_child(&state.children, &id, true, real_pid);
-
-                    let mut apps = state.apps.lock().unwrap();
-                    if let Some(instance) = apps.get_mut(&id) {
-                        if killed || force {
-                            instance.running = false;
-                            instance.pid = None;
-                            instance.process_info = None;
-                            instance.started_at = None;
-                            instance.stopping = false;
-                            instance.stop_requested_at = None;
-                            instance.exit_reason = Some("手动强制关闭".to_string());
-                            instance.manual_stop = true;
-                            push_to_buffer(&state.log_buffers, &id, "info", "已强制关闭");
-                        } else {
-                            push_to_buffer(&state.log_buffers, &id, "error", "关闭失败");
-                        }
-                    }
-                    drop(apps);
                     state.children.lock().unwrap().remove(&id);
                     stop_file_watcher(&state, &id);
                     save_apps_to_disk(&state);
 
-                    if killed || force {
+                    if killed {
+                        let mut apps = state.apps.lock().unwrap();
+                        if let Some(instance) = apps.get_mut(&id) {
+                            reset_instance_running_state(instance);
+                            instance.exit_reason = Some("手动强制关闭".to_string());
+                            instance.manual_stop = true;
+                            push_to_buffer(&state.log_buffers, &id, "info", "已强制关闭");
+                        }
                         return Ok(CommandResult {
                             code: 0,
                             data: None,
                             msg: "已强制关闭".to_string(),
                         });
                     }
-                    return Ok(CommandResult::error("关闭失败"));
+                    push_to_buffer(&state.log_buffers, &id, "error", "关闭失败，进程可能仍在运行");
+                    return Ok(CommandResult::error("关闭失败，进程可能仍在运行"));
                 }
 
                 // 普通关闭：仅向进程发送停止信号（WM_CLOSE / SIGTERM），不等待、不强杀；
@@ -914,24 +973,14 @@ pub async fn restart_app(
                 match instance.config.app_type {
                     AppType::Command => {
                         push_to_buffer(&state.log_buffers, &id, "info", "重启：关闭旧进程");
-                        instance.running = false;
-                        instance.pid = None;
-                        instance.process_info = None;
-                        instance.started_at = None;
+                        reset_instance_running_state(instance);
                         instance.exit_reason = Some("重启".to_string());
-                        instance.stopping = false;
-                        instance.stop_requested_at = None;
                     }
                     AppType::StaticServer => {
                         push_to_buffer(&state.log_buffers, &id, "info", "重启：停止静态服务器");
-                        instance.running = false;
-                        instance.pid = None;
-                        instance.process_info = None;
-                        instance.started_at = None;
+                        reset_instance_running_state(instance);
                         instance.server_port = None;
                         instance.exit_reason = Some("重启".to_string());
-                        instance.stopping = false;
-                        instance.stop_requested_at = None;
                     }
                 }
             }
@@ -955,11 +1004,9 @@ pub async fn restart_app(
 
     match app_type {
         AppType::Command => {
-            let mut apps = state.apps.lock().unwrap();
-            if let Some(instance) = apps.get_mut(&id) {
-                if spawn_and_track(instance, "重启", &state.children, &state.log_buffers, &state.job_object) {
-                    let pid = instance.pid.unwrap();
-                    drop(apps);
+            if spawn_and_track_unlocked(&state, &id, "重启") {
+                let pid = state.apps.lock().unwrap().get(&id).and_then(|i| i.pid);
+                if let Some(pid) = pid {
                     save_apps_to_disk(&state);
                     start_file_watcher(&state, &app, &id);
                     Ok(CommandResult::success(pid.to_string()))
@@ -967,7 +1014,7 @@ pub async fn restart_app(
                     Ok(CommandResult::error("重启失败"))
                 }
             } else {
-                Ok(CommandResult::error("应用不存在"))
+                Ok(CommandResult::error("重启失败"))
             }
         }
         AppType::StaticServer => {
@@ -1049,10 +1096,10 @@ pub async fn start_all_apps(state: State<'_, AppState>) -> Result<CommandResult<
 
         match app_type {
             AppType::Command => {
-                let mut apps = state.apps.lock().unwrap();
-                if let Some(instance) = apps.get_mut(&id) {
-                    if spawn_and_track(instance, "批量", &state.children, &state.log_buffers, &state.job_object) {
-                        started.push(instance.config.name.clone());
+                if spawn_and_track_unlocked(&state, &id, "批量") {
+                    let name = state.apps.lock().unwrap().get(&id).map(|i| i.config.name.clone());
+                    if let Some(name) = name {
+                        started.push(name);
                     }
                 }
             }
@@ -1121,7 +1168,25 @@ pub fn tool_read_hosts() -> Result<CommandResult<Vec<HostsEntry>>, String> {
     let mut entries: Vec<HostsEntry> = Vec::new();
     for (i, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // 被注释的 hosts 条目（如 `# 127.0.0.1 example.com`）按禁用状态解析，保证 UI 可见
+        if trimmed.starts_with('#') {
+            let body = trimmed.trim_start_matches('#').trim();
+            if is_commented_hosts_entry(body) {
+                let parts: Vec<&str> = body.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    entries.push(HostsEntry {
+                        ip: parts[0].to_string(),
+                        host: parts[1..].join(" "),
+                        enabled: false,
+                        original_line: line.to_string(),
+                        line_number: i + 1,
+                    });
+                }
+            }
             continue;
         }
 
@@ -1138,6 +1203,19 @@ pub fn tool_read_hosts() -> Result<CommandResult<Vec<HostsEntry>>, String> {
     }
 
     Ok(CommandResult::success(entries))
+}
+
+/// 判断注释内容是否为「被注释的 hosts 条目」（首段形如 IP 地址、后跟主机名）
+fn is_commented_hosts_entry(body: &str) -> bool {
+    let mut parts = body.split_whitespace();
+    match parts.next() {
+        Some(first) => {
+            let ip_like = !first.is_empty()
+                && first.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':');
+            ip_like && parts.next().is_some()
+        }
+        None => false,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1167,11 +1245,26 @@ pub fn tool_write_hosts(params: WriteHostsParams) -> Result<CommandResult<String
         let _ = fs::write(&backup_path, &original);
     }
 
+    // 当前条目（含禁用）的键，用于剔除文件中对应的旧注释行，避免禁用条目重复累积
+    let managed_keys: Vec<(String, String)> = params
+        .entries
+        .iter()
+        .map(|e| (e.ip.clone(), e.host.clone()))
+        .collect();
+
     let mut comment_lines: Vec<String> = Vec::new();
     for line in original.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
             comment_lines.push(line.to_string());
+        } else if trimmed.starts_with('#') {
+            let body = trimmed.trim_start_matches('#').trim();
+            let is_managed = managed_keys
+                .iter()
+                .any(|(ip, host)| body == format!("{} {}", ip, host));
+            if !is_managed {
+                comment_lines.push(line.to_string());
+            }
         }
     }
 
@@ -1287,8 +1380,10 @@ pub fn tool_find_port(
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        // 不能用 -p TCP：它只显示 IPv4 的 TCP，IPv6 监听（TCPv6，如 [::]:port）会被整行过滤掉，
+        // 导致"明明有监听却查不到端口"。改为全量 -ano 输出后按协议列过滤 TCP/TCPv6。
         let output = Command::new("netstat")
-            .args(["-ano", "-p", "TCP"])
+            .args(["-ano"])
             .creation_flags(0x08000000)
             .output();
 
@@ -1306,6 +1401,11 @@ pub fn tool_find_port(
         for line in stdout.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 5 {
+                continue;
+            }
+
+            let proto = parts[0];
+            if !proto.starts_with("TCP") {
                 continue;
             }
 
@@ -1331,7 +1431,7 @@ pub fn tool_find_port(
                     .unwrap_or_else(|| "未知".to_string());
 
                 results.push(PortMapping {
-                    protocol: "TCP".to_string(),
+                    protocol: proto.to_string(),
                     local_addr: local_addr.to_string(),
                     port: p,
                     pid,
@@ -1641,12 +1741,7 @@ pub async fn refresh_all(
                                 exited_apps.push(instance.config.name.clone());
                             }
                         }
-                        instance.running = false;
-                        instance.pid = None;
-                        instance.process_info = None;
-                        instance.started_at = None;
-                        instance.stopping = false;
-                        instance.stop_requested_at = None;
+                        reset_instance_running_state(instance);
                         instance.exit_reason = if should_auto_restart {
                             Some(format!("{} (自动重启中...)", exit_msg))
                         } else {
@@ -1687,20 +1782,23 @@ pub async fn refresh_all(
 
     if !restart_ids.is_empty() {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let mut apps = state.apps.lock().unwrap();
         for rid in &restart_ids {
-            if let Some(instance) = apps.get_mut(rid) {
-                if !instance.running {
-                    push_to_buffer(&state.log_buffers, rid, "info", "退出自动重启：重新启动进程...");
-                    if spawn_and_track(instance, "自动重启", &state.children, &state.log_buffers, &state.job_object) {
-                        push_to_buffer(&state.log_buffers, rid, "info", "退出自动重启成功");
-                    } else {
-                        push_to_buffer(&state.log_buffers, rid, "error", "退出自动重启失败");
-                    }
+            let should_restart = state
+                .apps
+                .lock()
+                .unwrap()
+                .get(rid)
+                .map(|i| !i.running)
+                .unwrap_or(false);
+            if should_restart {
+                push_to_buffer(&state.log_buffers, rid, "info", "退出自动重启：重新启动进程...");
+                if spawn_and_track_unlocked(&state, rid, "自动重启") {
+                    push_to_buffer(&state.log_buffers, rid, "info", "退出自动重启成功");
+                } else {
+                    push_to_buffer(&state.log_buffers, rid, "error", "退出自动重启失败");
                 }
             }
         }
-        drop(apps);
         save_apps_to_disk(&state);
     }
 
@@ -1739,8 +1837,28 @@ pub fn get_system_info(state: State<'_, AppState>) -> Result<CommandResult<Syste
 #[tauri::command]
 pub fn load_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<AppInstance>>, String> {
     let path = get_data_file_path(&state);
-    if let Ok(content) = fs::read_to_string(&path) {
-        if let Ok(data) = serde_json::from_str::<PersistData>(&content) {
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        // 文件不存在（首次启动）或读取失败：返回空列表
+        Err(_) => return Ok(CommandResult::success(vec![])),
+    };
+    let data = match serde_json::from_str::<PersistData>(&content) {
+        Ok(d) => d,
+        Err(e) => {
+            // 文件损坏：先备份原文件，避免后续保存把空列表覆盖掉损坏文件
+            let backup = format!("{}.corrupt.{}", path, now_ts());
+            if let Err(r) = fs::rename(&path, &backup) {
+                log_error(&state, &format!("配置解析失败且备份失败 {}: {} / {}", backup, e, r));
+            } else {
+                log_error(&state, &format!("配置解析失败，已备份为 {}: {}", backup, e));
+            }
+            return Ok(CommandResult::error(format!(
+                "配置文件损坏，原文件已备份（数据目录: {}），如需恢复可手动处理",
+                path
+            )));
+        }
+    };
+    {
             let max_order = data.apps.iter().map(|i| i.config.sort_order).max().unwrap_or(-1);
             state.init_sort_order(max_order);
 
@@ -1811,10 +1929,8 @@ pub fn load_apps(state: State<'_, AppState>) -> Result<CommandResult<Vec<AppInst
 
             let mut list: Vec<AppInstance> = apps.values().cloned().collect();
             list.sort_by_key(|a| a.config.sort_order);
-            return Ok(CommandResult::success(list));
-        }
+            Ok(CommandResult::success(list))
     }
-    Ok(CommandResult::success(vec![]))
 }
 
 #[tauri::command]
@@ -1851,6 +1967,12 @@ pub fn import_config(
             let mut buffers = state.log_buffers.lock().unwrap();
             for mut instance in data.apps {
                 if !apps.contains_key(&instance.config.id) {
+                    // 跳过无效端口（port=0 会绑定随机端口，导致 UI 显示端口与实际不符）
+                    if let Some(sc) = &instance.config.static_server {
+                        if sc.port == 0 {
+                            continue;
+                        }
+                    }
                     let id = instance.config.id.clone();
                     let sort_order = state.alloc_sort_order();
                     instance.config.sort_order = sort_order;
@@ -1939,10 +2061,10 @@ pub async fn start_auto_start_apps(
             tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
         }
 
-        let mut apps = state.apps.lock().unwrap();
-        if let Some(instance) = apps.get_mut(&id) {
-            if spawn_and_track(instance, "自动", &state.children, &state.log_buffers, &state.job_object) {
-                started.push(instance.config.name.clone());
+        if spawn_and_track_unlocked(&state, &id, "自动") {
+            let name = state.apps.lock().unwrap().get(&id).map(|i| i.config.name.clone());
+            if let Some(name) = name {
+                started.push(name);
             }
         }
     }

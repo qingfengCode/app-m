@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { Refresh, Plus, VideoPlay, SwitchButton, Search, Download, Upload, Sunny, Moon, Monitor, Grid, List, SetUp } from '@element-plus/icons-vue'
@@ -25,6 +25,7 @@ const isDark = ref(false)
 const lastRefreshTime = ref('')
 const viewMode = ref<'grid' | 'list'>('list')
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
+let disposed = false
 
 function toggleView() {
   viewMode.value = viewMode.value === 'list' ? 'grid' : 'list'
@@ -78,6 +79,37 @@ function initTheme() {
   }
 }
 
+// ---- 筛选条件持久化 ----
+const FILTERS_KEY = 'app-manager-filters'
+
+function restoreFilters() {
+  try {
+    const saved = localStorage.getItem(FILTERS_KEY)
+    if (!saved) return
+    const data = JSON.parse(saved)
+    if (typeof data.searchText === 'string') searchText.value = data.searchText
+    if (data.statusFilter === 'all' || data.statusFilter === 'running' || data.statusFilter === 'stopped') {
+      statusFilter.value = data.statusFilter
+    }
+    if (typeof data.groupFilter === 'string') groupFilter.value = data.groupFilter
+    if (data.typeFilter === 'all' || data.typeFilter === 'Command' || data.typeFilter === 'StaticServer') {
+      typeFilter.value = data.typeFilter
+    }
+  } catch {
+    // localStorage 数据损坏时忽略，使用默认筛选
+  }
+}
+
+watch([searchText, statusFilter, groupFilter, typeFilter], () => {
+  localStorage.setItem(FILTERS_KEY, JSON.stringify({
+    searchText: searchText.value,
+    statusFilter: statusFilter.value,
+    groupFilter: groupFilter.value,
+    typeFilter: typeFilter.value
+  }))
+})
+// ---- 筛选条件持久化结束 ----
+
 async function fetchGroups() {
   try {
     const res = await invoke<CommandResult<string[]>>('get_groups')
@@ -94,6 +126,8 @@ async function loadFromDisk() {
     const res = await invoke<CommandResult<AppInstance[]>>('load_apps')
     if (res.code === 0 && res.data) {
       apps.value = res.data
+    } else if (res.code !== 0) {
+      ElMessage.error(res.msg || '加载配置失败')
     }
   } catch (e) {
     console.error('加载数据失败', e)
@@ -190,7 +224,7 @@ async function handleReorder(targetId: string) {
   const toIdx = list.findIndex(a => a.config.id === targetId)
   if (fromIdx < 0 || toIdx < 0) return
   const [moved] = list.splice(fromIdx, 1)
-  const insertAt = fromIdx < toIdx ? toIdx - 1 : toIdx
+  const insertAt = toIdx
   list.splice(insertAt, 0, moved)
   apps.value = list
   const orders: [string, number][] = list.map((a, i) => [a.config.id, i])
@@ -252,6 +286,10 @@ async function handleDelete(app: AppInstance) {
       '确认删除',
       { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' }
     )
+  } catch {
+    return // cancelled
+  }
+  try {
     const res = await invoke<CommandResult<null>>('delete_app', { id: app.config.id })
     if (res.code === 0) {
       ElMessage.success('删除成功')
@@ -260,8 +298,8 @@ async function handleDelete(app: AppInstance) {
     } else {
       ElMessage.error(res.msg)
     }
-  } catch {
-    // cancelled
+  } catch (e) {
+    ElMessage.error('删除失败')
   }
 }
 
@@ -271,6 +309,8 @@ async function handleStartAll() {
     if (res.code === 0 && res.data) {
       ElMessage.success(`已启动 ${res.data.length} 个应用`)
       await refreshApps()
+    } else {
+      ElMessage.error(res.msg || '批量启动失败')
     }
   } catch (e) {
     ElMessage.error('批量启动失败')
@@ -284,13 +324,19 @@ async function handleStopAll() {
       cancelButtonText: '取消',
       type: 'warning'
     })
+  } catch {
+    return // cancelled
+  }
+  try {
     const res = await invoke<CommandResult<string[]>>('stop_all_apps')
     if (res.code === 0 && res.data) {
       ElMessage.success(`已关闭 ${res.data.length} 个应用`)
       await refreshApps()
+    } else {
+      ElMessage.error(res.msg || '批量关闭失败')
     }
-  } catch {
-    // cancelled
+  } catch (e) {
+    ElMessage.error('批量关闭失败')
   }
 }
 
@@ -376,6 +422,7 @@ async function handleDialogSuccess() {
 
 // 递归 setTimeout 轮询：上一次刷新完成后再调度下一次，避免慢请求重叠堆积
 async function scheduleRefresh() {
+  if (disposed) return
   refreshTimer = setTimeout(async () => {
     await refreshApps()
     await fetchSystemInfo()
@@ -384,7 +431,9 @@ async function scheduleRefresh() {
 }
 
 onMounted(async () => {
+  disposed = false
   initTheme()
+  restoreFilters()
   await loadFromDisk()
   await handleAutoStartApps()
   await refreshApps()
@@ -395,6 +444,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  disposed = true
   if (refreshTimer) {
     clearTimeout(refreshTimer)
     refreshTimer = null

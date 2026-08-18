@@ -141,7 +141,7 @@ async function openInBrowser() {
         <span class="stat" v-if="app.started_at">{{ runningDuration }}</span>
         <span class="stat" v-if="app.process_info">CPU <b class="cpu">{{ cpuText }}</b></span>
         <span class="stat" v-if="app.process_info">MEM <b class="mem">{{ memoryText }}</b></span>
-        <a v-if="serverUrl" :href="serverUrl" target="_blank" class="stat link" @click.stop>{{ serverUrl }}</a>
+        <a v-if="serverUrl" class="stat link" @click.prevent="openInBrowser">{{ serverUrl }}</a>
       </div>
     </div>
 

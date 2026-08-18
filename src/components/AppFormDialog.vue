@@ -230,6 +230,7 @@ async function handleSubmit() {
 
   submitting.value = true
   try {
+    const watchDirs = form.value.watch_dirs.filter(d => d.trim() !== '')
     const payload = {
       name: form.value.name,
       app_type: appType.value,
@@ -244,9 +245,7 @@ async function handleSubmit() {
       static_server: buildStaticServer(),
       url: appType.value === 'Command' ? (form.value.url || null) : null,
       watch_restart: form.value.watch_restart,
-      watch_dirs: form.value.watch_dirs.filter(d => d.trim() !== '').length > 0
-        ? form.value.watch_dirs.filter(d => d.trim() !== '')
-        : null,
+      watch_dirs: watchDirs.length > 0 ? watchDirs : null,
       exit_restart: form.value.exit_restart
     }
 
